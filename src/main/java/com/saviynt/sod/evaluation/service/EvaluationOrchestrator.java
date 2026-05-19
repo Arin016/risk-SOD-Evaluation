@@ -61,6 +61,11 @@ public class EvaluationOrchestrator {
             log.info("=== SOD Evaluation Started (jobId={}) ===", jobId);
             logMemory("START");
 
+            // Fail fast if securitySystemId not provided
+            if (request.securitySystemId() == null) {
+                throw new IllegalArgumentException("securitySystemId is required — evaluation must be scoped to a single security system");
+            }
+
             // ─── Phase 0: Load Configuration ───────────────────────────────────
             log.info("Phase 0: Loading configuration...");
             List<Long> rulesetKeys = request.rulesetKeys().isEmpty()
@@ -86,12 +91,41 @@ public class EvaluationOrchestrator {
 
             // ─── Phase 1: Load Graph + Resolve Access ──────────────────────────
             log.info("Phase 1: Loading hierarchy graph and resolving user access...");
-            accessGraph.loadGraph(request.securitySystemId());
+
+            // Collect all leaf nodes referenced by functions (tcodes from SAP + entitlements from NonSAP)
+            Set<Long> functionLeafNodes = new HashSet<>();
+            for (SAPFunctionDef def : sapFunctionDefs.values()) {
+                for (var groups : def.conditionsByEndpoint().values()) {
+                    for (var group : groups) {
+                        for (var cond : group.conditions()) {
+                            functionLeafNodes.add(cond.tcodeKey());
+                        }
+                    }
+                }
+            }
+            for (var entry : nonSAPConditions.entrySet()) {
+                collectLeafNodes(entry.getValue(), functionLeafNodes);
+            }
+            log.info("Phase 1: {} function leaf nodes collected (for subgraph)", functionLeafNodes.size());
+
+            accessGraph.loadGraph(request.securitySystemId(), functionLeafNodes, excludedEntPairs);
 
             String accountFilter = buildAccountFilter(request);
             Map<Long, List<Long>> directAssignments = accessDataDao.loadAccountEntitlements(accountFilter, request.entitlementQuery());
             Map<Long, long[]> accountMetadata = accessDataDao.loadAccountMetadata(accountFilter);
-            Map<Long, List<AuthEntry>> roleAuthMap = accessDataDao.loadEntitlementObjects(request.securitySystemId());
+
+            // Extract all (objectKey, fieldKey) pairs referenced by functions — only load auth for these
+            Set<Long> relevantObjFieldKeys = new HashSet<>();
+            for (SAPFunctionDef def : sapFunctionDefs.values()) {
+                for (var groups : def.conditionsByEndpoint().values()) {
+                    for (var group : groups) {
+                        for (var cond : group.conditions()) {
+                            relevantObjFieldKeys.add(cond.objectKey() * 100000L + cond.fieldKey());
+                        }
+                    }
+                }
+            }
+            Map<Long, List<AuthEntry>> roleAuthMap = accessDataDao.loadEntitlementObjects(request.securitySystemId(), relevantObjFieldKeys);
 
             // Resolve entitlements per user (merge accounts belonging to same user)
             List<UserAccess> users = resolveAllUsers(directAssignments, accountMetadata);
@@ -105,6 +139,17 @@ public class EvaluationOrchestrator {
             // Evidence map: "userIndex###funcKey" → evidence (collected during Phase 2, used in Phase 4)
             Map<String, List<FunctionEvidence>> evidenceMap = new java.util.concurrent.ConcurrentHashMap<>();
             functionEval.setGraphRefs(accessGraph.getGraph(), accessGraph.getReverseGraph());
+
+            // Pre-build per-user auth index ONCE (reused across all function evaluations)
+            // At 500K users this is ~1 GB but eliminates 72.5M HashMap constructions
+            log.info("Phase 2: Pre-building auth indexes for {} users...", users.size());
+            long authIndexStart = System.currentTimeMillis();
+            List<Map<Long, List<AuthEntry>>> userAuthIndexes = new ArrayList<>(users.size());
+            for (UserAccess user : users) {
+                userAuthIndexes.add(functionEval.buildUserAuthIndex(user.resolvedEntitlements(), roleAuthMap));
+            }
+            log.info("Phase 2: Auth indexes built in {}ms", System.currentTimeMillis() - authIndexStart);
+            logMemory("AFTER_AUTH_INDEX_BUILD");
 
             // Load TCD-field resolved tcodes (tcodes referenced by VALUE in function_objects with fieldkey=65)
             Map<Long, Map<Long, Set<Long>>> tcdResolvedTcodes = configDao.loadTcdFieldResolvedTcodes(sapFuncKeys, request.securitySystemId());
@@ -170,7 +215,7 @@ public class EvaluationOrchestrator {
                     for (long ep : def.endpoints()) {
                         futures.add(executor.submit(() -> {
                             long funcStart = System.currentTimeMillis();
-                            BitSet bits = functionEval.evaluateSAPWithEvidence(def, ep, finalUsers, finalRoleAuthMap, starTcodeKeys, evidenceMap);
+                            BitSet bits = functionEval.evaluateSAPWithEvidence(def, ep, finalUsers, finalRoleAuthMap, starTcodeKeys, evidenceMap, userAuthIndexes);
                             functionBitSets.put(funcKey + "###" + ep, bits);
                             int c = counter.incrementAndGet();
                             log.info("  [{}/{}] SAP func {}###ep{} ({}): {} users, {}ms",
@@ -333,17 +378,36 @@ public class EvaluationOrchestrator {
                                    Set<Long> tcodesWithDirectParent, Map<Long, Map<Long, Set<Long>>> tcdResolvedTcodes) {
         var jdbc = new org.springframework.jdbc.core.JdbcTemplate(
                 accessDataDao.getDataSource());
-
-        // --- Step 1: Clear previous run for this ruleset ---
         String rulesetCsv = rulesetKeys.stream().map(String::valueOf).collect(java.util.stream.Collectors.joining(","));
-        jdbc.update("DELETE FROM sodrisk_entitlement_new_job WHERE SODKEY IN (SELECT SODKEY FROM sodrisks_new_job WHERE RISKKEY IN (SELECT RISKID FROM risks WHERE RULESETKEY IN (" + rulesetCsv + ")))");
-        jdbc.update("DELETE FROM sodrisks_new_job WHERE RISKKEY IN (SELECT RISKID FROM risks WHERE RULESETKEY IN (" + rulesetCsv + "))");
 
-        // --- Step 2: Write summary rows ---
+        // --- Step 1: Load existing content hashes per violation identity (for delta detection) ---
+        long deltaStart = System.currentTimeMillis();
+        Map<String, long[]> oldHashes = new HashMap<>(); // "userKey###riskId###epKey" → [rowCount, hashSum]
+        try {
+            jdbc.query("SELECT sr.USERIDENTIFIER, sr.RISKKEY, sr.ENDPOINTKEY, COUNT(*) as CNT, " +
+                    "COALESCE(SUM(CRC32(CONCAT(se.FUNCTIONKEY,'#',se.TCODEKEY,'#',se.ASSOCIATEDSAPROLEKEY,'#',se.ACCOUNTKEY))),0) as HASH " +
+                    "FROM sodrisk_entitlement_new_job se JOIN sodrisks_new_job sr ON se.SODKEY = sr.SODKEY " +
+                    "WHERE sr.RISKKEY IN (SELECT RISKID FROM risks WHERE RULESETKEY IN (" + rulesetCsv + ")) " +
+                    "GROUP BY sr.USERIDENTIFIER, sr.RISKKEY, sr.ENDPOINTKEY", rs -> {
+                String key = rs.getLong(1) + "###" + rs.getLong(2) + "###" + rs.getLong(3);
+                oldHashes.put(key, new long[]{rs.getLong(4), rs.getLong(5)});
+            });
+        } catch (Exception e) {
+            log.info("No existing detail rows found (first run or table empty)");
+        }
+        log.info("Phase 4: Loaded {} existing violation hashes in {}ms", oldHashes.size(), System.currentTimeMillis() - deltaStart);
+
+        // --- Step 2: Upsert summary rows (sodrisks_new_job) — keep existing SODKEYs stable ---
+        // Load existing SODKEYs by violation identity
+        Map<String, Long> existingSodKeys = new HashMap<>();
+        jdbc.query("SELECT SODKEY, USERIDENTIFIER, RISKKEY, ENDPOINTKEY FROM sodrisks_new_job WHERE RISKKEY IN (SELECT RISKID FROM risks WHERE RULESETKEY IN (" + rulesetCsv + "))",
+                rs -> { existingSodKeys.put(rs.getLong(2) + "###" + rs.getLong(3) + "###" + rs.getLong(4), rs.getLong(1)); });
+        log.info("Phase 4: {} existing SODKEYs loaded (stable across runs)", existingSodKeys.size());
+
+        // Insert only NEW violations (not already in table)
         String insertSodRisk = "INSERT INTO sodrisks_new_job (RISKKEY, RISKCODE, USERIDENTIFIER, ENDPOINTKEY, STATUS, FIRSTIMPORTDATE, LASTIMPORTDATE, JOBID) VALUES (?,?,?,?,1,NOW(),NOW(),?)";
         List<Object[]> riskBatch = new java.util.ArrayList<>(1000);
 
-        // Pre-index for O(1) lookup
         Map<Long, List<Map.Entry<String, BitSet>>> bitSetsByRiskSummary = new HashMap<>();
         for (var e : violationBitSets.entrySet()) {
             long rid = Long.parseLong(e.getKey().split("###")[0]);
@@ -357,14 +421,17 @@ public class EvaluationOrchestrator {
                 String[] parts = entry.getKey().split("###");
                 long riskId = Long.parseLong(parts[0]);
                 long endpointKey = Long.parseLong(parts[1]);
-
                 BitSet bits = entry.getValue();
                 for (int i = bits.nextSetBit(0); i >= 0; i = bits.nextSetBit(i + 1)) {
                     UserAccess user = users.get(i);
-                    riskBatch.add(new Object[]{riskId, risk.riskName(), user.userKey(), endpointKey, jobId});
-                    if (riskBatch.size() >= 1000) {
-                        jdbc.batchUpdate(insertSodRisk, riskBatch);
-                        riskBatch.clear();
+                    String violationId = user.userKey() + "###" + riskId + "###" + endpointKey;
+                    if (!existingSodKeys.containsKey(violationId)) {
+                        // New violation — insert
+                        riskBatch.add(new Object[]{riskId, risk.riskName(), user.userKey(), endpointKey, jobId});
+                        if (riskBatch.size() >= 1000) {
+                            jdbc.batchUpdate(insertSodRisk, riskBatch);
+                            riskBatch.clear();
+                        }
                     }
                 }
             }
@@ -374,89 +441,198 @@ public class EvaluationOrchestrator {
             riskBatch.clear();
         }
 
-        // --- Step 3: Fetch generated SODKEYs ---
-        Map<String, Long> sodKeyMap = new java.util.HashMap<>();
+        // --- Step 3: Build sodKeyMap (existing + newly inserted) ---
+        Map<String, Long> sodKeyMap = new java.util.HashMap<>(existingSodKeys);
+        // Fetch newly generated SODKEYs
         jdbc.query("SELECT SODKEY, USERIDENTIFIER, RISKKEY, ENDPOINTKEY FROM sodrisks_new_job WHERE JOBID = ?",
                 rs -> { sodKeyMap.put(rs.getLong(2) + "###" + rs.getLong(3) + "###" + rs.getLong(4), rs.getLong(1)); }, jobId);
 
-        // --- Step 4: Write detail rows using LOAD DATA INFILE (10-50x faster than batch INSERT) ---
-        int detailProgress = 0;
+        // Delete stale violations from sodrisks_new_job (violations that no longer exist)
+        Set<String> currentViolationIds = new HashSet<>();
+        for (var bsEntry : violationBitSets.entrySet()) {
+            String[] parts = bsEntry.getKey().split("###");
+            long riskId = Long.parseLong(parts[0]);
+            long endpointKey = Long.parseLong(parts[1]);
+            BitSet bits = bsEntry.getValue();
+            for (int i = bits.nextSetBit(0); i >= 0; i = bits.nextSetBit(i + 1)) {
+                currentViolationIds.add(users.get(i).userKey() + "###" + riskId + "###" + endpointKey);
+            }
+        }
+        List<Long> staleSodKeys = new ArrayList<>();
+        for (var entry : existingSodKeys.entrySet()) {
+            if (!currentViolationIds.contains(entry.getKey())) {
+                staleSodKeys.add(entry.getValue());
+            }
+        }
+        if (!staleSodKeys.isEmpty()) {
+            String staleCsv = staleSodKeys.stream().map(String::valueOf).collect(java.util.stream.Collectors.joining(","));
+            jdbc.update("DELETE FROM sodrisk_entitlement_new_job WHERE SODKEY IN (" + staleCsv + ")");
+            jdbc.update("DELETE FROM sodrisks_new_job WHERE SODKEY IN (" + staleCsv + ")");
+            log.info("Phase 4: Closed {} stale violations", staleSodKeys.size());
+        }
+
+        // --- Step 4: Generate detail rows + compute new hashes per violation identity ---
         int totalViolationEntries = violationBitSets.values().stream().mapToInt(BitSet::cardinality).sum();
-        log.info("Phase 4: Writing detail rows for {} violations using pre-computed evidence ({} entries)...", totalViolationEntries, evidenceMap.size());
+        log.info("Phase 4: Computing detail rows for {} violations ({} evidence entries)...", totalViolationEntries, evidenceMap.size());
         long phase4DetailStart = System.currentTimeMillis();
 
-        // Write to temp file
-        java.io.File tempFile;
-        try {
-            tempFile = java.io.File.createTempFile("sod_detail_", ".csv");
-            try (var writer = new java.io.BufferedWriter(new java.io.FileWriter(tempFile), 1 << 20)) {
-            // Pre-index violationBitSets by riskId for O(1) lookup
-            Map<Long, List<Map.Entry<String, BitSet>>> bitSetsByRisk = new HashMap<>();
-            for (var bsEntry : violationBitSets.entrySet()) {
-                long riskId = Long.parseLong(bsEntry.getKey().split("###")[0]);
-                bitSetsByRisk.computeIfAbsent(riskId, k -> new ArrayList<>()).add(bsEntry);
-            }
+        // Collect all detail rows grouped by violation identity, compute hash
+        Map<String, List<String>> rowsByViolation = new HashMap<>(); // "userKey###riskId###epKey" → rows
+        Map<String, long[]> newHashes = new HashMap<>(); // "userKey###riskId###epKey" → [rowCount, hashSum]
 
-            for (Risk risk : risks) {
-                List<Map.Entry<String, BitSet>> riskEntries = bitSetsByRisk.get(risk.riskId());
-                if (riskEntries == null) continue;
-                for (var bsEntry : riskEntries) {
-                    String[] parts = bsEntry.getKey().split("###");
-                    BitSet bits = bsEntry.getValue();
-                    long endpointKey = Long.parseLong(parts[1]);
-                    if (bits.isEmpty()) continue;
+        Map<Long, List<Map.Entry<String, BitSet>>> bitSetsByRisk = new HashMap<>();
+        for (var bsEntry : violationBitSets.entrySet()) {
+            long riskId = Long.parseLong(bsEntry.getKey().split("###")[0]);
+            bitSetsByRisk.computeIfAbsent(riskId, k -> new ArrayList<>()).add(bsEntry);
+        }
 
-                    for (int i = bits.nextSetBit(0); i >= 0; i = bits.nextSetBit(i + 1)) {
-                        UserAccess user = users.get(i);
-                        Long sodKey = sodKeyMap.get(user.userKey() + "###" + risk.riskId() + "###" + endpointKey);
-                        if (sodKey == null) continue;
+        for (Risk risk : risks) {
+            List<Map.Entry<String, BitSet>> riskEntries = bitSetsByRisk.get(risk.riskId());
+            if (riskEntries == null) continue;
+            for (var bsEntry : riskEntries) {
+                String[] parts = bsEntry.getKey().split("###");
+                BitSet bits = bsEntry.getValue();
+                long endpointKey = Long.parseLong(parts[1]);
+                if (bits.isEmpty()) continue;
 
-                        for (long funcKey : risk.functionKeys()) {
-                            List<FunctionEvidence> evidences = evidenceMap.get(i + "###" + funcKey);
-                            if (evidences != null) {
-                                for (var ev : evidences) {
-                                    if (ev.endpointKey() == endpointKey || ev.endpointKey() == 0) {
-                                        writer.write(sodKey + "\t" + ev.accountKey() + "\t" + ev.assocSapRole() + "\t" + funcKey + "\t" + ev.tcodeKey() + "\t2\t" + ev.directRole());
-                                        writer.newLine();
-                                        detailProgress++;
-                                    }
+                for (int i = bits.nextSetBit(0); i >= 0; i = bits.nextSetBit(i + 1)) {
+                    UserAccess user = users.get(i);
+                    Long sodKey = sodKeyMap.get(user.userKey() + "###" + risk.riskId() + "###" + endpointKey);
+                    if (sodKey == null) continue;
+                    String violationId = user.userKey() + "###" + risk.riskId() + "###" + endpointKey;
+
+                    for (long funcKey : risk.functionKeys()) {
+                        List<FunctionEvidence> evidences = evidenceMap.get(i + "###" + funcKey);
+                        if (evidences != null) {
+                            for (var ev : evidences) {
+                                if (ev.endpointKey() == endpointKey || ev.endpointKey() == 0) {
+                                    String row = sodKey + "\t" + ev.accountKey() + "\t" + ev.assocSapRole() + "\t" + funcKey + "\t" + ev.tcodeKey() + "\t2\t" + ev.directRole();
+                                    rowsByViolation.computeIfAbsent(violationId, k -> new ArrayList<>()).add(row);
+                                    long h = crc32(funcKey + "#" + ev.tcodeKey() + "#" + ev.assocSapRole() + "#" + ev.accountKey());
+                                    newHashes.merge(violationId, new long[]{1, h}, (a, b) -> new long[]{a[0] + b[0], a[1] + b[1]});
                                 }
-                            } else {
-                                // NonSAP fallback
-                                NonSAPCondition condition = nonSAPConditions.get(funcKey);
-                                if (condition != null) {
-                                    long[] directs = user.accounts().isEmpty() ? new long[0] : user.accounts().getFirst().directAssignments();
-                                    List<Long> funcEntKeys = getFunctionEntitlementKeys(funcKey);
-                                    for (var acct : user.accounts()) {
-                                        for (long funcEntKey : funcEntKeys) {
-                                            if (java.util.Arrays.binarySearch(user.resolvedEntitlements(), funcEntKey) >= 0) {
-                                                long pr = accessGraph.findAncestorIn(funcEntKey, directs);
-                                                writer.write(sodKey + "\t" + acct.accountKey() + "\t" + pr + "\t" + funcKey + "\t" + funcEntKey + "\t2\t" + pr);
-                                                writer.newLine();
-                                                detailProgress++;
-                                            }
+                            }
+                        } else {
+                            // NonSAP fallback — full path evidence per account
+                            NonSAPCondition condition = nonSAPConditions.get(funcKey);
+                            if (condition != null) {
+                                List<Long> funcEntKeys = getFunctionEntitlementKeys(funcKey);
+                                for (var acct : user.accounts()) {
+                                    long[] directs = acct.directAssignments();
+                                    for (long funcEntKey : funcEntKeys) {
+                                        if (java.util.Arrays.binarySearch(user.resolvedEntitlements(), funcEntKey) >= 0) {
+                                            List<Long> path = accessGraph.findPath(directs, funcEntKey, maxDepth);
+                                            long directRole = path.isEmpty() ? 0 : path.getFirst();
+                                            long assocRole = path.size() >= 2 ? path.get(path.size() - 2) : directRole;
+                                            String pathCsv = path.size() > 1
+                                                    ? path.subList(0, path.size() - 1).stream().map(String::valueOf).collect(java.util.stream.Collectors.joining(","))
+                                                    : String.valueOf(directRole);
+                                            String row = sodKey + "\t" + acct.accountKey() + "\t" + assocRole + "\t" + funcKey + "\t" + funcEntKey + "\t2\t" + pathCsv;
+                                            rowsByViolation.computeIfAbsent(violationId, k -> new ArrayList<>()).add(row);
+                                            long h = crc32(funcKey + "#" + funcEntKey + "#" + assocRole + "#" + acct.accountKey());
+                                            newHashes.merge(violationId, new long[]{1, h}, (a, b) -> new long[]{a[0] + b[0], a[1] + b[1]});
                                         }
-                                        break;
                                     }
+                                    break;
                                 }
                             }
                         }
                     }
-                } // end bsEntry loop
+                }
             }
         }
-        log.info("Phase 4: Wrote {} detail rows to temp file in {}ms, loading into DB...", detailProgress, System.currentTimeMillis() - phase4DetailStart);
-        } catch (java.io.IOException e) {
-            throw new RuntimeException("Failed to write detail rows temp file", e);
+
+        // --- Step 5: Delta detection ---
+        Set<String> toInsert = new HashSet<>();
+        Set<String> toDelete = new HashSet<>();
+        int unchanged = 0;
+
+        for (var entry : newHashes.entrySet()) {
+            String violationId = entry.getKey();
+            long[] newVal = entry.getValue();
+            long[] oldVal = oldHashes.remove(violationId);
+
+            if (oldVal == null) {
+                toInsert.add(violationId);  // brand new
+            } else if (oldVal[0] == newVal[0] && oldVal[1] == newVal[1]) {
+                unchanged++;  // identical — skip
+            } else {
+                toDelete.add(violationId);  // changed — delete old, insert new
+                toInsert.add(violationId);
+            }
+        }
+        // Remaining oldHashes = stale (violation closed)
+        toDelete.addAll(oldHashes.keySet());
+
+        log.info("Phase 4: Delta detection: {} unchanged, {} to insert, {} to delete (of {} total violations)",
+                unchanged, toInsert.size(), toDelete.size(), newHashes.size());
+
+        // --- Step 6: Delete changed detail rows (SODKEYs are stable now, delta works) ---
+        if (!toDelete.isEmpty()) {
+            // Find SODKEYs for changed/stale violations
+            List<Long> deleteSodKeys = new ArrayList<>();
+            for (String vid : toDelete) {
+                Long sk = sodKeyMap.get(vid);
+                if (sk != null) deleteSodKeys.add(sk);
+            }
+            if (!deleteSodKeys.isEmpty()) {
+                String deleteCsv = deleteSodKeys.stream().map(String::valueOf).collect(java.util.stream.Collectors.joining(","));
+                jdbc.update("DELETE FROM sodrisk_entitlement_new_job WHERE SODKEY IN (" + deleteCsv + ")");
+                log.info("Phase 4: Deleted detail rows for {} changed violations", deleteSodKeys.size());
+            }
         }
 
-        // Bulk load via LOAD DATA LOCAL INFILE
-        long loadStart = System.currentTimeMillis();
-        jdbc.execute("LOAD DATA LOCAL INFILE '" + tempFile.getAbsolutePath().replace("\\", "\\\\") + "' INTO TABLE sodrisk_entitlement_new_job " +
-                "FIELDS TERMINATED BY '\\t' LINES TERMINATED BY '\\n' " +
-                "(SODKEY, ACCOUNTKEY, ASSOCIATEDSAPROLEKEY, FUNCTIONKEY, TCODEKEY, SODTYPE, PARENTROLEKEYASCSV)");
-        tempFile.delete();
-        log.info("Phase 4: Detail rows loaded into DB in {}ms. Total: {}ms", System.currentTimeMillis() - loadStart, System.currentTimeMillis() - phase4DetailStart);
+        // --- Step 7: Write only new/changed detail rows via LOAD DATA ---
+        if (!toInsert.isEmpty()) {
+            java.io.File tempFile;
+            try {
+                String sharedVolume = System.getenv("SOD_SHARED_VOLUME");
+                if (sharedVolume != null && !sharedVolume.isBlank()) {
+                    tempFile = new java.io.File(sharedVolume, "sod_detail_" + jobId + ".csv");
+                } else {
+                    tempFile = java.io.File.createTempFile("sod_detail_", ".csv");
+                }
+                int rowsWritten = 0;
+                try (var writer = new java.io.BufferedWriter(new java.io.FileWriter(tempFile), 1 << 20)) {
+                    for (String violationId : toInsert) {
+                        List<String> rows = rowsByViolation.get(violationId);
+                        if (rows != null) {
+                            for (String row : rows) {
+                                writer.write(row);
+                                writer.newLine();
+                                rowsWritten++;
+                            }
+                        }
+                    }
+                }
+                log.info("Phase 4: Wrote {} detail rows to file in {}ms, loading into DB...",
+                        rowsWritten, System.currentTimeMillis() - phase4DetailStart);
+
+                // Bulk load
+                long loadStart = System.currentTimeMillis();
+                String loadSql = sharedVolume != null && !sharedVolume.isBlank()
+                        ? "LOAD DATA INFILE '" + tempFile.getAbsolutePath().replace("\\", "\\\\") + "'"
+                        : "LOAD DATA LOCAL INFILE '" + tempFile.getAbsolutePath().replace("\\", "\\\\") + "'";
+                jdbc.execute(loadSql + " INTO TABLE sodrisk_entitlement_new_job " +
+                        "FIELDS TERMINATED BY '\\t' LINES TERMINATED BY '\\n' " +
+                        "(SODKEY, ACCOUNTKEY, ASSOCIATEDSAPROLEKEY, FUNCTIONKEY, TCODEKEY, SODTYPE, PARENTROLEKEYASCSV)");
+                tempFile.delete();
+                log.info("Phase 4: Loaded into DB in {}ms", System.currentTimeMillis() - loadStart);
+            } catch (java.io.IOException e) {
+                throw new RuntimeException("Failed to write detail rows file", e);
+            }
+        } else {
+            log.info("Phase 4: No detail rows to write (all unchanged)");
+        }
+
+        log.info("Phase 4: Complete in {}ms", System.currentTimeMillis() - phase4DetailStart);
+    }
+
+    /** CRC32 hash for delta detection */
+    private long crc32(String input) {
+        var crc = new java.util.zip.CRC32();
+        crc.update(input.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        return crc.getValue();
     }
 
     /** Cache for function entitlement keys (avoid repeated DB queries). */
@@ -475,6 +651,19 @@ public class EvaluationOrchestrator {
     /** Find which direct assignment provides access to a given entitlement. */
     private long findParentRole(long[] directAssignments, long targetEnt, UserAccess user) {
         return accessGraph.findAncestorIn(targetEnt, directAssignments);
+    }
+
+    /** Recursively extract entitlement keys from a NonSAP condition tree. */
+    private void collectLeafNodes(NonSAPCondition condition, Set<Long> out) {
+        if (condition instanceof NonSAPCondition.HasEntitlement h) {
+            out.add(h.entitlementKey());
+        } else if (condition instanceof NonSAPCondition.And a) {
+            collectLeafNodes(a.left(), out);
+            collectLeafNodes(a.right(), out);
+        } else if (condition instanceof NonSAPCondition.Or o) {
+            collectLeafNodes(o.left(), out);
+            collectLeafNodes(o.right(), out);
+        }
     }
 
     private void logMemory(String phase) {

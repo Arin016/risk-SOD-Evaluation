@@ -933,4 +933,44 @@ public class ScenarioBuilder {
         // This scenario uses the same data as S1 but will be tested by passing
         // entitlementQuery param to the API. No extra data needed.
     }
+
+    /**
+     * S25: Deep NonSAP hierarchy (4 levels) — tests full path evidence storage.
+     * Hierarchy: RoleTop → RoleMid1 → RoleMid2 → RoleBottom → EntitlementX
+     * Expected PARENTROLEKEYASCSV: "RoleTop,RoleMid1,RoleMid2,RoleBottom"
+     */
+    public void scenario25_deepNonSAPPath() throws SQLException {
+        System.out.println("  S25: Deep NonSAP path evidence (4 levels)...");
+
+        // Create entitlements
+        long entX = createNonSAPEnt("S25_ENT_TARGET");
+        long entY = createNonSAPEnt("S25_ENT_OTHER");
+
+        // Create 4-level hierarchy: top → mid1 → mid2 → bottom → entX
+        long roleBottom = createRole("S25_ROLE_BOTTOM");
+        long roleMid2 = createRole("S25_ROLE_MID2");
+        long roleMid1 = createRole("S25_ROLE_MID1");
+        long roleTop = createRole("S25_ROLE_TOP");
+
+        addHierarchy(roleTop, roleMid1);
+        addHierarchy(roleMid1, roleMid2);
+        addHierarchy(roleMid2, roleBottom);
+        addHierarchy(roleBottom, entX);
+
+        // Simple role for second function
+        long roleOther = createRole("S25_ROLE_OTHER");
+        addHierarchy(roleOther, entY);
+
+        // NonSAP functions
+        long f1 = createNonSAPFunction("S25_DEEP_FUNC");
+        addFuncEnt(f1, entX, 1, null, null);
+        long f2 = createNonSAPFunction("S25_OTHER_FUNC");
+        addFuncEnt(f2, entY, 1, null, null);
+        createRisk("S25_DEEP_PATH_RISK", f1, f2);
+
+        // Violators: assigned roleTop (reaches entX via 4 levels) + roleOther
+        batchAccounts("S25_VIOLATOR", ACCOUNTS_PER_SCENARIO, roleTop, roleOther);
+        // Non-violators: only roleTop (no second function)
+        batchAccounts("S25_SAFE", ACCOUNTS_PER_SCENARIO / 2, roleTop);
+    }
 }

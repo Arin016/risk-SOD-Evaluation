@@ -137,6 +137,7 @@ public class TestDataGenerator {
         sb.scenario22_broadRange();
         sb.scenario23_entitlementTypeExclusion();
         sb.scenario24_entQueryFilter();
+        sb.scenario25_deepNonSAPPath();
 
         // Scale up to production-level: add bulk functions, risks, auth, graph edges
         generateBulkFunctionsAndRisks(sb);

@@ -5,7 +5,6 @@
 Building a **from-scratch SOD (Segregation of Duties) evaluation microservice** to replace the existing ECMv4 Grails-based `RiskSODEvaluationJob`. The new system must produce **byte-for-byte identical results** to the old system while being orders of magnitude faster and using less memory.
 
 **Owner:** Arin Mallanna (Backend Dev, Saviynt)
-**Senior:** Niranjan Patil (will review code)
 **Repo:** `/Users/arin.mallanna/AAG/sod-evaluation-service`
 **Old System:** `/Users/arin.mallanna/AAG/ECMG66/ecmv4` (Grails/Groovy, 7635-line `RiskSODEvaluationService.groovy`)
 
@@ -224,7 +223,7 @@ UNION ALL SELECT 'new', COUNT(*) FROM sodrisk_entitlement_new_job WHERE SODKEY I
 
 ---
 
-## Niranjan's Feedback & Direction
+## Feedback & Direction
 
 - Explore Go/Python (conclusion: Java is best for this workload — graph traversal not matrix math)
 - Use libs where possible instead of custom logic

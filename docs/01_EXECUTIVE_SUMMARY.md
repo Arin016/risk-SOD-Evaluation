@@ -37,7 +37,7 @@ A from-scratch replacement for Saviynt's SOD (Segregation of Duties) evaluation 
 - ❌ Inherent Role SOD / Actual vs Potential — separate features, not in scope
 
 ## Next Steps
-1. Niranjan code review (scheduled)
+1. Code review (scheduled)
 2. Hitachi-scale stress test on dev environment
 3. Deploy to dev K8s cluster for integration testing
 4. SOD_NONSAP_ORG_CALCULATION implementation (Oracle EBS customers)

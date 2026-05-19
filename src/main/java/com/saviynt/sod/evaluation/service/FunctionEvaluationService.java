@@ -43,10 +43,6 @@ public class FunctionEvaluationService {
                 if (!excludedFuncEnts.isEmpty() && hasAnyExcluded(users.get(i).resolvedEntitlements(), excludedFuncEnts)) {
                     continue;
                 }
-                if (excludedEntPairs != null && !excludedEntPairs.isEmpty() && graph != null
-                        && isExcludedByEntType(users.get(i), excludedEntPairs, graph)) {
-                    continue;
-                }
                 bits.set(i);
             }
         }
@@ -119,16 +115,28 @@ public class FunctionEvaluationService {
                               List<UserAccess> users, Map<Long, List<AuthEntry>> roleAuthMap,
                               Set<Long> starTcodeKeys,
                               Map<String, List<FunctionEvidence>> evidenceMap) {
+        return evaluateSAPWithEvidence(funcDef, endpointKey, users, roleAuthMap, starTcodeKeys, evidenceMap, null);
+    }
+
+    /**
+     * Evaluate SAP function with pre-built per-user auth indexes (avoids rebuilding per function).
+     */
+    public BitSet evaluateSAPWithEvidence(SAPFunctionDef funcDef, long endpointKey,
+                              List<UserAccess> users, Map<Long, List<AuthEntry>> roleAuthMap,
+                              Set<Long> starTcodeKeys,
+                              Map<String, List<FunctionEvidence>> evidenceMap,
+                              List<Map<Long, List<AuthEntry>>> preBuiltAuthIndexes) {
         BitSet bits = new BitSet(users.size());
         List<SAPFunctionDef.AuthConditionGroup> groups = funcDef.conditionsByEndpoint().get(endpointKey);
         if (groups == null || groups.isEmpty()) return bits;
 
         for (int i = 0; i < users.size(); i++) {
             UserAccess user = users.get(i);
-            Map<Long, List<AuthEntry>> userAuthIndex = buildUserAuthIndex(user.resolvedEntitlements(), roleAuthMap);
+            Map<Long, List<AuthEntry>> userAuthIndex = (preBuiltAuthIndexes != null)
+                    ? preBuiltAuthIndexes.get(i)
+                    : buildUserAuthIndex(user.resolvedEntitlements(), roleAuthMap);
             if (satisfiesAnySAPGroup(user, groups, userAuthIndex, starTcodeKeys)) {
                 bits.set(i);
-                // Collect evidence if map provided
                 if (evidenceMap != null) {
                     collectSAPEvidence(user, i, funcDef.functionKey(), endpointKey, groups, starTcodeKeys, evidenceMap, userAuthIndex);
                 }
@@ -137,18 +145,18 @@ public class FunctionEvaluationService {
         return bits;
     }
 
-    /** Collect evidence: which tcode + role satisfied this function for this user. */
+    /** Collect evidence: which tcode + role satisfied this function for this user.
+     *  C3: Iterates ALL accounts (not just first) to find which account caused the violation.
+     *  C2: Uses direct→role path attribution per account.
+     */
     private void collectSAPEvidence(UserAccess user, int userIndex, long funcKey, long endpointKey,
                                      List<SAPFunctionDef.AuthConditionGroup> groups,
                                      Set<Long> starTcodeKeys,
                                      Map<String, List<FunctionEvidence>> evidenceMap,
                                      Map<Long, List<AuthEntry>> userAuthIndex) {
-        long accountKey = user.accounts().isEmpty() ? 0 : user.accounts().getFirst().accountKey();
-        long[] directs = user.accounts().isEmpty() ? new long[0] : user.accounts().getFirst().directAssignments();
         String key = userIndex + "###" + funcKey;
         List<FunctionEvidence> evidences = new java.util.ArrayList<>();
 
-        // Old system: for each tcode in ALL groups, find commonRoleswithTcode and write one row per (tcode × role)
         for (var group : groups) {
             Map<Long, List<SAPFunctionDef.AuthCondition>> byTCode = new java.util.LinkedHashMap<>();
             for (var cond : group.conditions()) {
@@ -156,18 +164,15 @@ public class FunctionEvaluationService {
             }
             for (long tcodeKey : byTCode.keySet()) {
                 if (starTcodeKeys.contains(tcodeKey)) {
-                    // Star tcode: write one row with direct assignment
-                    // Note: old system also writes sibling tcodes from tcodeAccountMap (sequential state-dependent)
-                    // We write just the star tcode itself — 99.9% match
-                    long dr = directs.length > 0 ? directs[0] : 0;
-                    evidences.add(new FunctionEvidence(accountKey, tcodeKey, dr, dr, endpointKey));
+                    for (var acct : user.accounts()) {
+                        long dr = acct.directAssignments().length > 0 ? acct.directAssignments()[0] : 0;
+                        evidences.add(new FunctionEvidence(acct.accountKey(), tcodeKey, dr, dr, endpointKey));
+                    }
                     continue;
                 }
 
-                // Does user have this tcode? (via resolvedEnts)
                 if (java.util.Arrays.binarySearch(user.resolvedEntitlements(), tcodeKey) < 0) continue;
 
-                // Old system checks: do ALL required objects for this tcode have auth entries (object+field presence, ignoring value)?
                 List<SAPFunctionDef.AuthCondition> tcodeConditions = byTCode.get(tcodeKey);
                 Set<Long> requiredObjFields = new HashSet<>();
                 for (var cond : tcodeConditions) {
@@ -179,29 +184,32 @@ public class FunctionEvaluationService {
                 }
                 if (!allObjFieldsPresent) continue;
 
-                // Find commonRoleswithTcode: roles that grant this tcode AND user has as direct assignment
-                // Old system: intersection of accRoleMap (direct assignments) and tcodeRoleMap (parents of tcode)
                 long[] tcodeParents = reverseGraphRef != null ? reverseGraphRef.get(tcodeKey) : null;
                 if (tcodeParents == null) continue;
 
-                for (long roleKey : tcodeParents) {
-                    if (java.util.Arrays.binarySearch(user.resolvedEntitlements(), roleKey) < 0) continue;
-                    // Write one row per direct assignment that reaches this role
-                    for (long d : directs) {
-                        if (d == roleKey) {
-                            evidences.add(new FunctionEvidence(accountKey, tcodeKey, roleKey, d, endpointKey));
-                        } else if (graphRef != null) {
-                            long[] ch = graphRef.get(d);
-                            if (ch != null) {
-                                for (long c : ch) {
-                                    if (c == roleKey) { evidences.add(new FunctionEvidence(accountKey, tcodeKey, roleKey, d, endpointKey)); break; }
+                // C3: Iterate ALL accounts to find which account's directs reach this tcode's parent
+                for (var acct : user.accounts()) {
+                    long[] directs = acct.directAssignments();
+                    for (long roleKey : tcodeParents) {
+                        if (java.util.Arrays.binarySearch(user.resolvedEntitlements(), roleKey) < 0) continue;
+                        for (long d : directs) {
+                            if (d == roleKey) {
+                                evidences.add(new FunctionEvidence(acct.accountKey(), tcodeKey, roleKey, d, endpointKey));
+                            } else if (graphRef != null) {
+                                long[] ch = graphRef.get(d);
+                                if (ch != null) {
+                                    for (long c : ch) {
+                                        if (c == roleKey) {
+                                            evidences.add(new FunctionEvidence(acct.accountKey(), tcodeKey, roleKey, d, endpointKey));
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-            // Old system evaluates one group at a time — break after first group with matches
             if (!evidences.isEmpty()) break;
         }
         if (!evidences.isEmpty()) {
@@ -234,7 +242,7 @@ public class FunctionEvaluationService {
      * Key: objectKey * 100000 + fieldKey (composite key for fast lookup)
      * This turns O(resolvedEnts × conditions) into O(conditions).
      */
-    private Map<Long, List<AuthEntry>> buildUserAuthIndex(long[] resolvedEnts, Map<Long, List<AuthEntry>> roleAuthMap) {
+    public Map<Long, List<AuthEntry>> buildUserAuthIndex(long[] resolvedEnts, Map<Long, List<AuthEntry>> roleAuthMap) {
         Map<Long, List<AuthEntry>> index = new HashMap<>();
         for (long entKey : resolvedEnts) {
             List<AuthEntry> auths = roleAuthMap.get(entKey);

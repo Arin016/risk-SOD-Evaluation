@@ -28,24 +28,22 @@ public class AccessDataDao {
 
     /**
      * Load role hierarchy graph scoped to a security system's endpoints.
-     * Only loads edges where the parent belongs to the system's entitlement types.
+     * securitySystemId is REQUIRED — loading without system scope would pull 500M+ rows and OOM.
      */
     public Map<Long, List<Long>> loadEntitlements2(Long securitySystemId) {
-        log.info("Loading ENTITLEMENTS2...");
+        if (securitySystemId == null) {
+            throw new IllegalArgumentException("securitySystemId is required for loadEntitlements2 — unscoped load would exhaust memory");
+        }
+        log.info("Loading ENTITLEMENTS2 for system {}...", securitySystemId);
         Map<Long, List<Long>> graph = new HashMap<>(30_000);
 
-        String sql;
-        if (securitySystemId != null) {
-            sql = """
+        String sql = """
                 SELECT e2.ENTITLEMENT_VALUE1KEY, e2.ENTITLEMENT_VALUE2KEY
                 FROM entitlements2 e2
                 JOIN entitlement_values ev ON e2.ENTITLEMENT_VALUE1KEY = ev.ENTITLEMENT_VALUEKEY
                 JOIN entitlement_types et ON ev.ENTITLEMENTTYPEKEY = et.ENTITLEMENTTYPEKEY
                 JOIN endpoints ep ON et.ENDPOINTKEY = ep.ENDPOINTKEY
                 WHERE ep.SECURITYSYSTEMKEY = """ + securitySystemId;
-        } else {
-            sql = "SELECT ENTITLEMENT_VALUE1KEY, ENTITLEMENT_VALUE2KEY FROM entitlements2";
-        }
 
         jdbc.query(sql, rs -> {
             long parent = rs.getLong(1);
@@ -57,9 +55,83 @@ public class AccessDataDao {
         return graph;
     }
 
-    /** Backward-compatible overload */
+    /** @deprecated Use loadEntitlements2(securitySystemId) — system scope is required */
+    @Deprecated
     public Map<Long, List<Long>> loadEntitlements2() {
-        return loadEntitlements2(null);
+        throw new UnsupportedOperationException("securitySystemId is required — use loadEntitlements2(Long)");
+    }
+
+    /**
+     * Load ONLY the subgraph of entitlements2 that is relevant to the given function leaf nodes.
+     * Uses a recursive CTE to walk UP from leaf nodes (tcodes/entitlements referenced by functions)
+     * to find all ancestor nodes, then loads only edges within that ancestor set.
+     *
+     * At Hitachi scale: 500M total edges → ~1-5M relevant edges (8 GB → 80 MB).
+     */
+    public Map<Long, List<Long>> loadEntitlements2Subgraph(Long securitySystemId, Set<Long> functionLeafNodes) {
+        if (securitySystemId == null) {
+            throw new IllegalArgumentException("securitySystemId is required");
+        }
+        if (functionLeafNodes == null || functionLeafNodes.isEmpty()) {
+            log.warn("No function leaf nodes provided — falling back to full graph load");
+            return loadEntitlements2(securitySystemId);
+        }
+
+        log.info("Loading ENTITLEMENTS2 subgraph for system {} (starting from {} leaf nodes)...", securitySystemId, functionLeafNodes.size());
+        long start = System.currentTimeMillis();
+
+        // Step 1: Find all ancestor nodes via recursive CTE
+        // Walk UP from function leaf nodes through the hierarchy
+        String leafCsv = functionLeafNodes.stream().map(String::valueOf).collect(java.util.stream.Collectors.joining(","));
+
+        String cteSql = """
+                WITH RECURSIVE ancestors AS (
+                    SELECT DISTINCT e2.ENTITLEMENT_VALUE1KEY AS node
+                    FROM entitlements2 e2
+                    JOIN entitlement_values ev ON e2.ENTITLEMENT_VALUE1KEY = ev.ENTITLEMENT_VALUEKEY
+                    JOIN entitlement_types et ON ev.ENTITLEMENTTYPEKEY = et.ENTITLEMENTTYPEKEY
+                    JOIN endpoints ep ON et.ENDPOINTKEY = ep.ENDPOINTKEY
+                    WHERE ep.SECURITYSYSTEMKEY = %d
+                      AND e2.ENTITLEMENT_VALUE2KEY IN (%s)
+                    UNION
+                    SELECT e2.ENTITLEMENT_VALUE1KEY
+                    FROM entitlements2 e2
+                    JOIN ancestors a ON e2.ENTITLEMENT_VALUE2KEY = a.node
+                    JOIN entitlement_values ev ON e2.ENTITLEMENT_VALUE1KEY = ev.ENTITLEMENT_VALUEKEY
+                    JOIN entitlement_types et ON ev.ENTITLEMENTTYPEKEY = et.ENTITLEMENTTYPEKEY
+                    JOIN endpoints ep ON et.ENDPOINTKEY = ep.ENDPOINTKEY
+                    WHERE ep.SECURITYSYSTEMKEY = %d
+                )
+                SELECT node FROM ancestors
+                """.formatted(securitySystemId, leafCsv, securitySystemId);
+
+        Set<Long> relevantNodes = new HashSet<>(functionLeafNodes);
+        jdbc.query(cteSql, rs -> { relevantNodes.add(rs.getLong(1)); });
+        log.info("Recursive CTE found {} relevant nodes (from {} leaf nodes) in {}ms",
+                relevantNodes.size(), functionLeafNodes.size(), System.currentTimeMillis() - start);
+
+        // Step 2: Load only edges where parent is in the relevant set
+        // (child will be relevant too since we walked up from leaves)
+        String relevantCsv = relevantNodes.stream().map(String::valueOf).collect(java.util.stream.Collectors.joining(","));
+        String edgeSql = """
+                SELECT e2.ENTITLEMENT_VALUE1KEY, e2.ENTITLEMENT_VALUE2KEY
+                FROM entitlements2 e2
+                JOIN entitlement_values ev ON e2.ENTITLEMENT_VALUE1KEY = ev.ENTITLEMENT_VALUEKEY
+                JOIN entitlement_types et ON ev.ENTITLEMENTTYPEKEY = et.ENTITLEMENTTYPEKEY
+                JOIN endpoints ep ON et.ENDPOINTKEY = ep.ENDPOINTKEY
+                WHERE ep.SECURITYSYSTEMKEY = %d
+                  AND e2.ENTITLEMENT_VALUE1KEY IN (%s)
+                """.formatted(securitySystemId, relevantCsv);
+
+        Map<Long, List<Long>> graph = new HashMap<>(relevantNodes.size());
+        jdbc.query(edgeSql, rs -> {
+            long parent = rs.getLong(1);
+            long child = rs.getLong(2);
+            graph.computeIfAbsent(parent, k -> new ArrayList<>(4)).add(child);
+        });
+
+        log.info("Loaded subgraph: {} parent nodes, {}ms total", graph.size(), System.currentTimeMillis() - start);
+        return graph;
     }
 
     /**
@@ -120,13 +192,25 @@ public class AccessDataDao {
 
     /**
      * Load SAP auth data scoped to a security system's endpoints.
-     * Only loads auth for roles belonging to the system's entitlement types.
+     * securitySystemId is REQUIRED — loading without system scope would pull 1.2B+ rows and OOM.
+     * Optionally filtered by (objectKey, fieldKey) pairs to avoid loading irrelevant auth.
      */
     public Map<Long, List<AuthEntry>> loadEntitlementObjects(Long securitySystemId) {
-        log.info("Loading ENTITLEMENT_OBJECTS...");
-        String sql;
-        if (securitySystemId != null) {
-            sql = """
+        return loadEntitlementObjects(securitySystemId, null);
+    }
+
+    /**
+     * Load SAP auth data filtered to only (objectKey, fieldKey) pairs referenced by functions.
+     * At Hitachi scale: 1.2B total rows → ~2-5M relevant rows (200 MB vs 60 GB).
+     */
+    public Map<Long, List<AuthEntry>> loadEntitlementObjects(Long securitySystemId, Set<Long> relevantObjFieldKeys) {
+        if (securitySystemId == null) {
+            throw new IllegalArgumentException("securitySystemId is required for loadEntitlementObjects — unscoped load would exhaust memory");
+        }
+        log.info("Loading ENTITLEMENT_OBJECTS for system {}{}...", securitySystemId,
+                relevantObjFieldKeys != null ? " (filtered to " + relevantObjFieldKeys.size() + " obj/field pairs)" : " (unfiltered)");
+
+        String sql = """
                 SELECT eo.ENTITLEMENT_VALUEKEY, eo.OBJECTKEY, eo.FIELD_KEY, eo.MINVALUE, eo.MXVALUE
                 FROM entitlement_objects eo
                 JOIN entitlement_values ev ON eo.ENTITLEMENT_VALUEKEY = ev.ENTITLEMENT_VALUEKEY
@@ -134,12 +218,22 @@ public class AccessDataDao {
                 JOIN endpoints ep ON et.ENDPOINTKEY = ep.ENDPOINTKEY
                 WHERE (eo.objectdeleted = 0 OR eo.objectdeleted IS NULL)
                 AND ep.SECURITYSYSTEMKEY = """ + securitySystemId;
-        } else {
-            sql = """
-                SELECT ENTITLEMENT_VALUEKEY, OBJECTKEY, FIELD_KEY, MINVALUE, MXVALUE
-                FROM entitlement_objects
-                WHERE (objectdeleted = 0 OR objectdeleted IS NULL)
-                """;
+
+        // Filter by relevant (objectKey, fieldKey) pairs — avoids loading 1.2B irrelevant rows
+        if (relevantObjFieldKeys != null && !relevantObjFieldKeys.isEmpty()) {
+            // Build (OBJECTKEY, FIELD_KEY) IN clause using composite key decomposition
+            // compositeKey = objectKey * 100000 + fieldKey
+            StringBuilder filter = new StringBuilder(" AND (");
+            boolean first = true;
+            for (long compositeKey : relevantObjFieldKeys) {
+                long objKey = compositeKey / 100000L;
+                long fldKey = compositeKey % 100000L;
+                if (!first) filter.append(" OR ");
+                filter.append("(eo.OBJECTKEY=").append(objKey).append(" AND eo.FIELD_KEY=").append(fldKey).append(")");
+                first = false;
+            }
+            filter.append(")");
+            sql += filter.toString();
         }
 
         Map<Long, List<AuthEntry>> roleAuth = new HashMap<>(50_000);
@@ -158,8 +252,9 @@ public class AccessDataDao {
         return roleAuth;
     }
 
-    /** Backward-compatible overload */
+    /** @deprecated Use loadEntitlementObjects(securitySystemId) — system scope is required */
+    @Deprecated
     public Map<Long, List<AuthEntry>> loadEntitlementObjects() {
-        return loadEntitlementObjects(null);
+        throw new UnsupportedOperationException("securitySystemId is required — use loadEntitlementObjects(Long)");
     }
 }

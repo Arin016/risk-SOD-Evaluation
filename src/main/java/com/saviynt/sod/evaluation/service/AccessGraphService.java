@@ -40,12 +40,49 @@ public class AccessGraphService {
      * Always reloads fresh — ensures correctness after data imports.
      */
     public void loadGraph(Long securitySystemId) {
+        loadGraph(securitySystemId, null);
+    }
+
+    /**
+     * Load graph — either full or function-scoped subgraph.
+     * When functionLeafNodes is provided, only loads edges relevant to those nodes (massive memory savings).
+     */
+    public void loadGraph(Long securitySystemId, Set<Long> functionLeafNodes) {
+        loadGraph(securitySystemId, functionLeafNodes, null);
+    }
+
+    /**
+     * Load graph with optional excluded edges (for NonSAP entitlement type exclusion).
+     * Excluded edges are omitted during construction so BFS naturally avoids excluded paths.
+     */
+    public void loadGraph(Long securitySystemId, Set<Long> functionLeafNodes, Set<String> excludedEdges) {
         log.info("Loading role hierarchy graph from ENTITLEMENTS2...");
         long start = System.currentTimeMillis();
 
         resolvedCache.clear();
 
-        Map<Long, List<Long>> adjacency = accessDataDao.loadEntitlements2(securitySystemId);
+        Map<Long, List<Long>> adjacency = (functionLeafNodes != null && !functionLeafNodes.isEmpty())
+                ? accessDataDao.loadEntitlements2Subgraph(securitySystemId, functionLeafNodes)
+                : accessDataDao.loadEntitlements2(securitySystemId);
+
+        // C1: Remove excluded edges before building the graph
+        if (excludedEdges != null && !excludedEdges.isEmpty()) {
+            int removed = 0;
+            for (String pair : excludedEdges) {
+                String[] parts = pair.split("#");
+                try {
+                    long parent = Long.parseLong(parts[0]);
+                    long child = Long.parseLong(parts[1]);
+                    List<Long> children = adjacency.get(parent);
+                    if (children != null && children.remove(Long.valueOf(child))) {
+                        removed++;
+                    }
+                } catch (NumberFormatException e) {
+                    // PROGRAM field might not be a valid long — skip
+                }
+            }
+            if (removed > 0) log.info("Removed {} excluded edges from graph (NonSAP entitlement type exclusion)", removed);
+        }
 
         // Convert List<Long> to long[] for memory efficiency and cache locality
         this.graph = HashMap.newHashMap(adjacency.size());

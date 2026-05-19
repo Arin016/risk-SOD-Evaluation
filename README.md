@@ -16,10 +16,18 @@ SOD evaluation determines which users in an organization have conflicting access
 | Scale | Old System | This System |
 |-------|-----------|-------------|
 | 91,500 accounts, 500K graph edges | OOM / 21 hours (64 GB) | 1 min 47 sec (1 GB) |
-| 309 users, 108 functions (real SAP) | 334 sec | 24 sec |
+| 309 users, 108 functions (real SAP) | 334 sec | 4 sec compute + 14 sec writes |
 | 18,300 accounts (test data) | 872 sec | 12 sec |
 
 Detection accuracy: 100% match with the old system (zero false positives, zero false negatives).
+
+### Optimizations (2026-05-19)
+- Function-scoped subgraph via recursive CTE (500M edges → 5M)
+- Auth filtering by function-referenced (objectKey, fieldKey) pairs (1.2B → 2-5M rows)
+- Per-user auth index caching (72.5M builds → 500K)
+- Excluded edges removed at graph construction (no runtime checks)
+- Full path evidence stored in PARENTROLEKEYASCSV
+- Per-account attribution for multi-account users
 
 ## Repository Structure
 
@@ -89,10 +97,10 @@ java -cp "target/test-classes:mysql-connector.jar" \
 The evaluation runs in 5 phases:
 
 - **Phase 0** — Load configuration (risks, functions, auth conditions)
-- **Phase 1** — Load role hierarchy graph, resolve user entitlements via BFS
+- **Phase 1** — Load function-scoped subgraph (recursive CTE), resolve user entitlements via BFS
 - **Phase 2** — Evaluate all functions in parallel (virtual threads), collect evidence
 - **Phase 3** — Detect violations via BitSet AND across risk functions
-- **Phase 4** — Write results to DB (LOAD DATA INFILE for bulk performance)
+- **Phase 4** — Delta writes: hash comparison per violation, only write changed rows (LOAD DATA INFILE)
 
 See `docs/02_TECHNICAL_ARCHITECTURE.md` for the full design.
 
